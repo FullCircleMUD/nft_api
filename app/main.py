@@ -5,15 +5,19 @@ Standalone FastAPI service that serves XLS-24d compliant NFT metadata
 from the game's PostgreSQL database. Runs independently of the game
 server so metadata is always available for XRPL marketplace resolution.
 
+Routes to the correct database based on the request hostname:
+    api.fcmud.world     -> production database
+    api.dev.fcmud.world -> staging/dev database
+
 Endpoints:
     GET /nft/{uri_id}   -> XLS-24d JSON metadata
     GET /health         -> health check
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.db import fetch_nft
+from app.db import fetch_nft, DATABASE_URL_PROD, DATABASE_URL_DEV
 from app.metadata import build_metadata
 
 app = FastAPI(
@@ -31,15 +35,27 @@ app.add_middleware(
 
 
 @app.get("/health")
-def health():
+def health(request: Request):
     """Health check for Railway deployment."""
-    return {"status": "ok"}
+    host = request.headers.get("host", "")
+    is_dev = "dev" in host
+    return {
+        "status": "ok",
+        "environment": "dev" if is_dev else "prod",
+        "db_configured": bool(DATABASE_URL_DEV if is_dev else DATABASE_URL_PROD),
+    }
 
 
 @app.get("/nft/{uri_id}")
-def nft_metadata(uri_id: int):
+def nft_metadata(uri_id: int, request: Request):
     """Serve XLS-24d NFT metadata for the given uri_id."""
-    row = fetch_nft(uri_id)
+    host = request.headers.get("host", "")
+
+    try:
+        row = fetch_nft(host, uri_id)
+    except ConnectionError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     if not row:
         raise HTTPException(status_code=404, detail="NFT not found")
 

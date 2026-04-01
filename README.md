@@ -2,22 +2,30 @@
 
 Standalone API service that serves XLS-24d compliant NFT metadata from the game's PostgreSQL database. Runs independently of the game server so XRPL marketplace metadata resolution is always available.
 
-## Endpoint
+## Endpoints
 
 ```
 GET /nft/{uri_id}  ->  XLS-24d JSON metadata
-GET /health        ->  { "status": "ok" }
+GET /health        ->  { "status": "ok", "environment": "dev|prod", "db_configured": true }
 ```
 
-The URI baked into each minted NFToken points here:
-```
-https://api.fcmud.world/nft/42
-```
+## Multi-Environment Routing
+
+A single API instance serves both staging and production by routing on the request hostname:
+
+| Domain | Database | XRPL Network |
+|--------|----------|--------------|
+| `api.dev.fcmud.world` | Staging PostgreSQL | Testnet |
+| `api.fcmud.world` | Production PostgreSQL | Mainnet |
+
+Both domains point to the same Railway service. The `Host` header determines which database connection pool is used. Each connection is **read-only**.
+
+If the database for a given environment isn't configured yet (e.g. production before beta launch), requests to that domain return `503 Service Unavailable`.
 
 ## Architecture
 
 - **FastAPI** + **uvicorn** — lightweight, async-capable
-- **psycopg2** — read-only connection to the game's Postgres
+- **psycopg2** with connection pooling — two read-only pools, one per environment
 - **No Django/Evennia dependency** — pure Python, zero game engine overhead
 - Reads from `xrpl_nftgamestate` and `xrpl_nftitemtype` tables only
 
@@ -26,15 +34,21 @@ https://api.fcmud.world/nft/42
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-# Edit .env with your DATABASE_URL
+# Edit .env with your database URLs
 uvicorn app.main:app --reload
 ```
 
 ## Railway Deployment
 
 Set these environment variables in Railway:
-- `DATABASE_URL` — Railway Postgres connection string (same DB as game server)
-- `NFT_IMAGE_BASE_URL` — Supabase image bucket URL (optional, has default)
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `DATABASE_URL_DEV` | Yes (from alpha) | Staging PostgreSQL connection string |
+| `DATABASE_URL_PROD` | Yes (from beta) | Production PostgreSQL connection string |
+| `NFT_IMAGE_BASE_URL` | No (has default) | Supabase image bucket URL |
+
+Add both `api.fcmud.world` and `api.dev.fcmud.world` as custom domains on the Railway service.
 
 The `Procfile` handles the rest.
 
