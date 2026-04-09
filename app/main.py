@@ -10,7 +10,7 @@ Routes to the correct database based on the request hostname:
     api.dev.fcmud.world -> staging/dev database
 
 Endpoints:
-    GET /nft/{uri_id}   -> XLS-24d JSON metadata
+    GET /{uri_id}       -> XLS-24d JSON metadata
     GET /health         -> health check
 """
 
@@ -46,7 +46,7 @@ def health(request: Request):
     }
 
 
-@app.get("/nft/{uri_id}")
+@app.get("/{uri_id}")
 def nft_metadata(uri_id: int, request: Request):
     """Serve XLS-24d NFT metadata for the given uri_id."""
     host = request.headers.get("host", "")
