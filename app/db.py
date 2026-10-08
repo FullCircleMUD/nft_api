@@ -5,8 +5,9 @@ Maintains two connection pools — one for production (api.fcmud.world)
 and one for staging/dev (api.dev.fcmud.world). The correct pool is
 selected at request time based on the Host header.
 
-Both connections are read-only. Only reads from xrpl_nftgamestate and
-xrpl_nftitemtype tables.
+Both connections are read-only. Reads xrpl_nftgamestate, xrpl_nftitemtype,
+xrpl_fungiblegamestate and xrpl_currencytype, and answers only for items on
+the ledger.
 """
 
 import os
@@ -56,38 +57,84 @@ def get_pool_for_host(host: str):
     return _pool_prod
 
 
-def fetch_nft(host: str, uri_id: int) -> dict | None:
-    """Fetch NFT game state + item type by uri_id.
-
-    Routes to the correct database based on the request host.
-    Returns a dict with all fields needed for metadata, or None.
-    Raises ConnectionError if the database for this environment
-    isn't configured.
-    """
+def _pool_or_raise(host: str):
+    """The pool for this host, or ConnectionError if it is not configured."""
     pool = get_pool_for_host(host)
     if pool is None:
         env = "staging" if "dev" in host else "production"
         raise ConnectionError(f"{env} database not configured")
+    return pool
 
-    query = """
-        SELECT
-            gs.nftoken_id,
-            gs.uri_id,
-            gs.metadata,
-            it.name         AS item_name,
-            it.description  AS item_description,
-            it.typeclass    AS item_typeclass,
-            it.prototype_key AS item_prototype_key
-        FROM xrpl_nftgamestate gs
-        LEFT JOIN xrpl_nftitemtype it ON gs.item_type_id = it.id
-        WHERE gs.uri_id = %s
-    """
+
+def _read(host: str, query: str, params: tuple) -> list[dict]:
+    """Run one read-only query and return its rows as dicts."""
+    pool = _pool_or_raise(host)
     conn = pool.getconn()
     try:
         conn.set_session(readonly=True, autocommit=True)
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(query, (uri_id,))
-            row = cur.fetchone()
-        return dict(row) if row else None
+            cur.execute(query, params)
+            return [dict(row) for row in cur.fetchall()]
     finally:
         pool.putconn(conn)
+
+
+def fetch_item(host: str, item_id: int) -> dict | None:
+    """An exported item and its type, or None for one not on the ledger.
+
+    The exported item is the token's one row with no container: an item
+    inside it is ONCHAIN under the same token and is described with it.
+    Raises ConnectionError if the database for this environment isn't
+    configured.
+    """
+    rows = _read(host, """
+        SELECT
+            gs.id,
+            gs.metadata,
+            it.name          AS item_name,
+            it.description   AS item_description,
+            it.prototype_key AS item_prototype_key,
+            it.taxon         AS item_taxon
+        FROM xrpl_nftgamestate gs
+        JOIN xrpl_nftitemtype it ON gs.item_type_id = it.id
+        WHERE gs.id = %s
+          AND gs.location = 'ONCHAIN'
+          AND gs.contained_in_id IS NULL
+    """, (item_id,))
+    return rows[0] if rows else None
+
+
+def fetch_contents(host: str, item_id: int) -> tuple[list[dict], list[dict]]:
+    """Everything inside an exported item, at any depth, and every balance in it.
+
+    Returns (items, balances). Each item carries `contained_in_id`, its name and
+    its metadata; each balance its `contained_in_id`, currency name and amount.
+    """
+    items = _read(host, """
+        WITH RECURSIVE inside AS (
+            SELECT id, contained_in_id, item_type_id, metadata
+            FROM xrpl_nftgamestate
+            WHERE contained_in_id = %s AND location = 'ONCHAIN'
+          UNION ALL
+            SELECT child.id, child.contained_in_id, child.item_type_id, child.metadata
+            FROM xrpl_nftgamestate child
+            JOIN inside ON child.contained_in_id = inside.id
+            WHERE child.location = 'ONCHAIN'
+        )
+        SELECT inside.id, inside.contained_in_id, inside.metadata,
+               it.name AS item_name
+        FROM inside
+        JOIN xrpl_nftitemtype it ON inside.item_type_id = it.id
+        ORDER BY inside.id
+    """, (item_id,))
+    holders = [item_id] + [item["id"] for item in items]
+    balances = _read(host, """
+        SELECT fs.contained_in_id,
+               COALESCE(ct.name, fs.currency_code) AS currency_name,
+               fs.balance
+        FROM xrpl_fungiblegamestate fs
+        LEFT JOIN xrpl_currencytype ct ON ct.currency_code = fs.currency_code
+        WHERE fs.location = 'NFT' AND fs.contained_in_id = ANY(%s)
+        ORDER BY fs.contained_in_id, currency_name
+    """, (holders,))
+    return items, balances

@@ -1,91 +1,104 @@
-"""Tests for metadata builder — no database needed."""
+"""The metadata builder, against XLS-24 — no database needed."""
 
-from app.metadata import build_metadata, _derive_category
+from decimal import Decimal
 
-
-def test_derive_category_weapon():
-    assert _derive_category("typeclasses.items.weapons.longsword_nft_item.LongswordNFTItem") == "Weapon"
+from app.metadata import ART_V0_SCHEMA, build_metadata, category_of
 
 
-def test_derive_category_wearable():
-    assert _derive_category("typeclasses.items.wearables.wearable_nft_item.WearableNFTItem") == "Wearable"
-
-
-def test_derive_category_none():
-    assert _derive_category(None) == "Item"
-
-
-def test_derive_category_unknown():
-    assert _derive_category("typeclasses.items.something_new.FooItem") == "Item"
-
-
-def test_build_metadata_basic():
+def an_item(**overrides):
+    """An exported item as the database hands it back."""
     row = {
-        "nftoken_id": "abc123",
-        "uri_id": 42,
+        "id": 1234,
         "metadata": {},
-        "item_name": "Bronze Longsword",
-        "item_description": "A broad bronze blade.",
-        "item_typeclass": "typeclasses.items.weapons.longsword_nft_item.LongswordNFTItem",
-        "item_prototype_key": "bronze_longsword",
+        "item_name": "Leather Backpack",
+        "item_description": "A sturdy leather pack.",
+        "item_prototype_key": "leather_backpack",
+        "item_taxon": 3,
     }
-    result = build_metadata(row)
-    assert result["type"] == "game_item"
-    assert result["name"] == "Bronze Longsword"
-    assert result["description"] == "A broad bronze blade."
-    assert result["collection"]["name"] == "FullCircleMUD"
-    assert "primary_display" in result["properties"]
-    assert result["properties"]["primary_display"]["primary_uri"].endswith("bronze_longsword.png")
-
-    attrs = result["properties"]["attributes"]
-    categories = [a for a in attrs if a["attribute_name"] == "Category"]
-    assert len(categories) == 1
-    assert categories[0]["value"] == "Weapon"
+    row.update(overrides)
+    return row
 
 
-def test_build_metadata_with_instance_metadata():
-    row = {
-        "nftoken_id": "abc123",
-        "uri_id": 42,
-        "metadata": {"durability": 85, "custom_name": "Excalibur"},
-        "item_name": "Bronze Longsword",
-        "item_description": "A broad bronze blade.",
-        "item_typeclass": "typeclasses.items.weapons.longsword_nft_item.LongswordNFTItem",
-        "item_prototype_key": "bronze_longsword",
-    }
-    result = build_metadata(row)
-    attrs = {a["attribute_name"]: a for a in result["properties"]["attributes"]}
-    assert "Durability" in attrs
-    assert attrs["Durability"]["value"] == 85
-    assert attrs["Durability"]["value_type"] == "int"
-    assert "Custom Name" in attrs
-    assert attrs["Custom Name"]["value"] == "Excalibur"
+def test_the_standard_fields_are_xls24_art_v0():
+    result = build_metadata(an_item())
+    assert result["schema"] == ART_V0_SCHEMA
+    assert result["nftType"] == "art.v0"
+    assert result["name"] == "Leather Backpack"
+    assert result["description"] == "A sturdy leather pack."
+    assert result["image"].endswith("leather_backpack.png")
 
 
-def test_build_metadata_name_override():
-    row = {
-        "nftoken_id": "abc123",
-        "uri_id": 42,
-        "metadata": {"name": "The Blade of Kings"},
-        "item_name": "Bronze Longsword",
-        "item_description": "A broad bronze blade.",
-        "item_typeclass": "typeclasses.items.weapons.longsword_nft_item.LongswordNFTItem",
-        "item_prototype_key": "bronze_longsword",
-    }
-    result = build_metadata(row)
-    assert result["name"] == "The Blade of Kings"
+def test_the_item_id_rides_along():
+    assert build_metadata(an_item())["item_id"] == 1234
 
 
-def test_build_metadata_no_prototype():
-    row = {
-        "nftoken_id": "abc123",
-        "uri_id": 42,
-        "metadata": {},
-        "item_name": "Mystery Item",
-        "item_description": "",
-        "item_typeclass": "typeclasses.items.base_nft_item.BaseNFTItem",
-        "item_prototype_key": None,
-    }
-    result = build_metadata(row)
-    assert "primary_display" not in result["properties"]
-    assert result["description"] == "A Mystery Item from FullCircleMUD."
+def test_the_items_own_metadata_overrides_name_and_description():
+    result = build_metadata(an_item(metadata={"name": "Old Faithful", "description": "Patched."}))
+    assert (result["name"], result["description"]) == ("Old Faithful", "Patched.")
+
+
+def test_an_item_with_no_prototype_still_has_an_image():
+    # art.v0 requires one.
+    assert build_metadata(an_item(item_prototype_key=None))["image"]
+
+
+def test_category_and_family_come_from_the_taxon():
+    result = build_metadata(an_item(item_taxon=1))
+    traits = {t["trait_type"]: t["value"] for t in result["attributes"]}
+    assert traits["Category"] == "Weapon"
+    assert result["collection"] == {"name": "FullCircleMUD", "family": "Weapons"}
+
+
+def test_an_unknown_taxon_is_general():
+    assert category_of(99) == category_of(12)
+
+
+def test_scalar_metadata_becomes_traits():
+    result = build_metadata(an_item(metadata={"durability": 85, "enchanted": True,
+                                              "runes": ["a", "b"], "name": "x"}))
+    traits = {t["trait_type"]: t["value"] for t in result["attributes"]}
+    assert traits["Durability"] == 85
+    assert traits["Enchanted"] == "True"
+    assert "Runes" not in traits
+    assert "Name" not in traits
+
+
+def test_a_container_lists_everything_inside_at_any_depth():
+    items = [
+        {"id": 1235, "contained_in_id": 1234, "item_name": "Pouch", "metadata": {}},
+        {"id": 1236, "contained_in_id": 1235, "item_name": "Iron Dagger",
+         "metadata": {"durability": 40}},
+    ]
+    balances = [
+        {"contained_in_id": 1234, "currency_name": "Gold", "balance": Decimal("50.000000")},
+        {"contained_in_id": 1235, "currency_name": "Wheat", "balance": Decimal("4.5")},
+    ]
+    contents = build_metadata(an_item(), items, balances)["contents"]
+    assert contents["balances"] == [{"currency": "Gold", "amount": "50"}]
+    (pouch,) = contents["items"]
+    assert (pouch["item_id"], pouch["name"]) == (1235, "Pouch")
+    assert pouch["contents"]["balances"] == [{"currency": "Wheat", "amount": "4.5"}]
+    (dagger,) = pouch["contents"]["items"]
+    assert (dagger["item_id"], dagger["name"], dagger["metadata"]) == (
+        1236, "Iron Dagger", {"durability": 40})
+    assert dagger["contents"] is None
+
+
+def test_a_container_carries_a_contents_summary_trait():
+    items = [
+        {"id": 1235, "contained_in_id": 1234, "item_name": "Pouch", "metadata": {}},
+        {"id": 1236, "contained_in_id": 1235, "item_name": "Iron Dagger", "metadata": {}},
+    ]
+    balances = [
+        {"contained_in_id": 1234, "currency_name": "Gold", "balance": Decimal("30")},
+        {"contained_in_id": 1235, "currency_name": "Gold", "balance": Decimal("20")},
+    ]
+    result = build_metadata(an_item(), items, balances)
+    traits = {t["trait_type"]: t["value"] for t in result["attributes"]}
+    assert traits["Contents"] == "2 items, 50 Gold"
+
+
+def test_an_item_holding_nothing_has_no_contents():
+    result = build_metadata(an_item())
+    assert "contents" not in result
+    assert "Contents" not in {t["trait_type"] for t in result["attributes"]}
